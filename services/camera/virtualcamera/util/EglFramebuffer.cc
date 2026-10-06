@@ -75,12 +75,23 @@ EglFrameBuffer::EglFrameBuffer(EGLDisplay display,
 }
 
 EglFrameBuffer::~EglFrameBuffer() {
-  if (mFramebufferId != 0) {
-    glDeleteFramebuffers(1, &mFramebufferId);
+  // The GL objects belong to the EGL context of the render thread that created them. When a
+  // session is torn down, VirtualCameraSession::close() stops the render thread - and with it the
+  // context - before the streams holding these framebuffers are released, so by then the context
+  // is gone. Calling the GL driver without a current context dereferences a null pointer and takes
+  // the HAL down, so the objects are only reclaimed here when our own context is still current;
+  // otherwise the driver frees them together with the context.
+  if (eglGetCurrentContext() != EGL_NO_CONTEXT &&
+      eglGetCurrentDisplay() == mEglDisplay) {
+    if (mFramebufferId != 0) {
+      glDeleteFramebuffers(1, &mFramebufferId);
+    }
+    if (mTextureId != 0) {
+      glDeleteTextures(1, &mTextureId);
+    }
   }
-  if (mTextureId != 0) {
-    glDeleteTextures(1, &mTextureId);
-  }
+
+  // Only needs the EGLDisplay, which outlives the render thread.
   if (mEglImageKhr != EGL_NO_IMAGE_KHR) {
     eglDestroyImageKHR(mEglDisplay, mEglImageKhr);
   }

@@ -18,6 +18,7 @@
 #define LOG_TAG "VirtualCameraProvider"
 #include "VirtualCameraProvider.h"
 
+#include <algorithm>
 #include <atomic>
 #include <memory>
 #include <mutex>
@@ -130,8 +131,30 @@ ndk::ScopedAStatus VirtualCameraProvider::getConcurrentCameraIds(
     return cameraStatus(Status::ILLEGAL_ARGUMENT);
   }
 
-  // No support for any concurrent combination.
   _aidl_return->clear();
+
+  // Virtual cameras are software devices: they do not contend for ISP, CSID or
+  // sensor resources, so every registered camera can be streamed at the same
+  // time and is advertised as part of a single concurrent combination.
+  // The camera framework re-queries this list whenever the provider reports a
+  // camera being added or removed, which keeps the combination in sync with
+  // virtual cameras that are created or destroyed at runtime.
+  const std::lock_guard<std::mutex> lock(mLock);
+  if (mCameras.empty()) {
+    return ndk::ScopedAStatus::ok();
+  }
+
+  // The framework identifies a camera with the id portion of the HAL device
+  // name ("device@<major>.<minor>/<type>/<id>"), so the combination has to
+  // advertise getCameraId() and not the device name used as map key.
+  ConcurrentCameraIdCombination combination;
+  combination.combination.reserve(mCameras.size());
+  for (const auto& [_, camera] : mCameras) {
+    combination.combination.push_back(camera->getCameraId());
+  }
+  ALOGI("%s: advertising %zu camera(s) as one concurrent combination", __func__,
+        combination.combination.size());
+  _aidl_return->push_back(std::move(combination));
   return ndk::ScopedAStatus::ok();
 }
 
@@ -139,13 +162,34 @@ ndk::ScopedAStatus VirtualCameraProvider::isConcurrentStreamCombinationSupported
     const std::vector<CameraIdAndStreamCombination>& in_configs,
     bool* _aidl_return) {
   ALOGV("%s", __func__);
-  (void)in_configs;
   if (_aidl_return == nullptr) {
     return cameraStatus(Status::ILLEGAL_ARGUMENT);
   }
 
-  // No support for any stream combination at the moment.
-  *_aidl_return = false;
+  // A set of cameras can stream concurrently when every requested camera is
+  // registered and can handle its own stream configuration. Virtual cameras
+  // share no hardware resources, so no further cross-device constraint applies.
+  bool supported = !in_configs.empty();
+  {
+    const std::lock_guard<std::mutex> lock(mLock);
+    for (const auto& config : in_configs) {
+      // config.cameraId is a camera id, not a HAL device name: find the camera
+      // whose id matches.
+      auto it = std::find_if(mCameras.begin(), mCameras.end(),
+                             [&config](const auto& entry) {
+                               return entry.second->getCameraId() == config.cameraId;
+                             });
+      if (it == mCameras.end() ||
+          !it->second->isStreamCombinationSupported(config.streamConfiguration)) {
+        ALOGV("%s: rejected concurrent configuration for camera %s", __func__,
+              config.cameraId.c_str());
+        supported = false;
+        break;
+      }
+    }
+  }
+
+  *_aidl_return = supported;
   return ndk::ScopedAStatus::ok();
 }
 

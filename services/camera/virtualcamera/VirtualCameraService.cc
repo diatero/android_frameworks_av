@@ -35,6 +35,7 @@
 #include "aidl/android/companion/virtualcamera/LensFacing.h"
 #include "aidl/android/companion/virtualcamera/VirtualCameraConfiguration.h"
 #include "android/binder_auto_utils.h"
+#include "android/binder_ibinder.h"
 #include "android/binder_interface_utils.h"
 #include "android/binder_libbinder.h"
 #include "android/binder_status.h"
@@ -61,6 +62,8 @@ using ::aidl::android::companion::virtualcamera::VirtualCameraConfiguration;
 namespace {
 
 constexpr char kCameraIdPrefix[] = "v";
+// Numerical portion of the first generated camera id; see createCameraIdLocked().
+constexpr int kInitialIdNumericalPortion = 1000;
 constexpr int kVgaWidth = 640;
 constexpr int kVgaHeight = 480;
 constexpr int kMaxFps = 60;
@@ -79,10 +82,25 @@ Available commands:
        --input_fps=(fps) - specify input fps for test camera, valid values are from 1 to 1000
        --sensor_orientation=(0|90|180|270) - Clockwise angle through which the output image 
            needs to be rotated to be upright on the device screen in its native orientation
+     The command can be called several times; every call adds another test camera
+     rendering its own test pattern.
  * disable_test_camera
+     Removes every test camera created with enable_test_camera.
 )";
 constexpr char kCreateVirtualDevicePermission[] =
     "android.permission.CREATE_VIRTUAL_DEVICE";
+
+// android.permission.CREATE_VIRTUAL_DEVICE is declared as internal|role, which cannot be
+// granted to a regular application. A preinstalled owner application declares this signature
+// level permission instead, so that it can own a camera without relaxing the check for
+// anything else on the device.
+constexpr char kOwnerPermission[] =
+    "org.lineageos.virtualcameraowner.permission.REGISTER_VIRTUAL_CAMERA";
+
+bool hasCameraOwnerPermission(const PermissionsProxy& permissionProxy) {
+  return permissionProxy.checkCallingPermission(kCreateVirtualDevicePermission) ||
+         permissionProxy.checkCallingPermission(kOwnerPermission);
+}
 
 constexpr std::array<const char*, 3> kRequiredEglExtensions = {
     "GL_OES_EGL_image_external",
@@ -90,8 +108,8 @@ constexpr std::array<const char*, 3> kRequiredEglExtensions = {
     "GL_EXT_YUV_target",
 };
 
-// Numerical portion for id to assign to next created camera.
-static std::atomic_int sNextIdNumericalPortion{1000};
+// Numerical portion for id to assign to next created test camera.
+static std::atomic_int sNextIdNumericalPortion{kInitialIdNumericalPortion};
 
 ndk::ScopedAStatus validateConfiguration(
     const VirtualCameraConfiguration& configuration) {
@@ -244,33 +262,52 @@ ndk::ScopedAStatus verifyHardwareBufferSupport() {
           .c_str());
 }
 
-std::string createCameraId(const int32_t deviceId) {
-  return kCameraIdPrefix + std::to_string(deviceId) + "_" +
-         std::to_string(sNextIdNumericalPortion++);
-}
-
 }  // namespace
+
+std::string VirtualCameraService::createCameraIdLocked(const int32_t deviceId) {
+  const std::string prefix = std::string(kCameraIdPrefix) + std::to_string(deviceId) + "_";
+  int64_t candidate = kInitialIdNumericalPortion;
+
+  bool taken = true;
+  while (taken) {
+    taken = false;
+    const std::string candidateId = prefix + std::to_string(candidate);
+    for (const auto& entry : mTokenToCameraName) {
+      const std::string& cameraName = entry.second;
+      const auto separator = cameraName.rfind('/');
+      const std::string id =
+          separator == std::string::npos ? cameraName : cameraName.substr(separator + 1);
+      if (id == candidateId) {
+        taken = true;
+        ++candidate;
+        break;
+      }
+    }
+  }
+
+  return prefix + std::to_string(candidate);
+}
 
 VirtualCameraService::VirtualCameraService(
     std::shared_ptr<VirtualCameraProvider> virtualCameraProvider,
     const PermissionsProxy& permissionProxy)
     : mVirtualCameraProvider(virtualCameraProvider),
-      mPermissionProxy(permissionProxy) {
+      mPermissionProxy(permissionProxy),
+      mOwnerDeathRecipient(AIBinder_DeathRecipient_new(onOwnerDied)) {
 }
 
 ndk::ScopedAStatus VirtualCameraService::registerCamera(
     const ::ndk::SpAIBinder& token,
     const VirtualCameraConfiguration& configuration, const int32_t deviceId,
     bool* _aidl_return) {
-  return registerCamera(token, configuration, createCameraId(deviceId),
-                        deviceId, _aidl_return);
+  return registerCamera(token, configuration, std::string(), deviceId, _aidl_return);
 }
 
 ndk::ScopedAStatus VirtualCameraService::registerCamera(
     const ::ndk::SpAIBinder& token,
     const VirtualCameraConfiguration& configuration,
     const std::string& cameraId, const int32_t deviceId, bool* _aidl_return) {
-  if (!mPermissionProxy.checkCallingPermission(kCreateVirtualDevicePermission)) {
+  if (!hasCameraOwnerPermission(mPermissionProxy)) {
     return ndk::ScopedAStatus::fromExceptionCode(EX_SECURITY);
   }
   return registerCameraNoCheck(token, configuration, cameraId, deviceId,
@@ -317,8 +354,10 @@ ndk::ScopedAStatus VirtualCameraService::registerCameraNoCheck(
     return ndk::ScopedAStatus::ok();
   }
 
+  const std::string idToUse =
+      cameraId.empty() ? createCameraIdLocked(deviceId) : cameraId;
   std::shared_ptr<VirtualCameraDevice> camera =
-      mVirtualCameraProvider->createCamera(configuration, cameraId, deviceId);
+      mVirtualCameraProvider->createCamera(configuration, idToUse, deviceId);
   if (camera == nullptr) {
     ALOGE("Failed to create camera for binder token 0x%" PRIxPTR,
           reinterpret_cast<uintptr_t>(token.get()));
@@ -328,15 +367,51 @@ ndk::ScopedAStatus VirtualCameraService::registerCameraNoCheck(
   }
 
   mTokenToCameraName[token] = camera->getCameraName();
+
+  // Unregister the camera when the owner process goes away.
+  auto* cookie = new OwnerDeathCookie{this, camera->getCameraName()};
+  if (AIBinder_linkToDeath(token.get(), mOwnerDeathRecipient, cookie) == STATUS_OK) {
+    mOwnerDeathCookies[camera->getCameraName()] = cookie;
+  } else {
+    ALOGE("Failed to register for the death of the owner of camera %s",
+          camera->getCameraName().c_str());
+    delete cookie;
+  }
+
   *_aidl_return = true;
   return ndk::ScopedAStatus::ok();
 }
 
+void VirtualCameraService::onOwnerDied(void* cookie) {
+  auto* info = static_cast<OwnerDeathCookie*>(cookie);
+  if (info == nullptr) {
+    return;
+  }
+  info->service->removeCameraOfDeadOwner(info->cameraName);
+  delete info;
+}
+
+void VirtualCameraService::removeCameraOfDeadOwner(const std::string& cameraName) {
+  std::lock_guard lock(mLock);
+
+  mOwnerDeathCookies.erase(cameraName);
+
+  for (auto it = mTokenToCameraName.begin(); it != mTokenToCameraName.end(); ++it) {
+    if (it->second != cameraName) {
+      continue;
+    }
+    mVirtualCameraProvider->removeCamera(cameraName);
+    mTokenToCameraName.erase(it);
+    ALOGI("Removed camera %s because its owner went away", cameraName.c_str());
+    return;
+  }
+}
+
 ndk::ScopedAStatus VirtualCameraService::unregisterCamera(
     const ::ndk::SpAIBinder& token) {
-  if (!mPermissionProxy.checkCallingPermission(kCreateVirtualDevicePermission)) {
-    ALOGE("%s: caller (pid %d, uid %d) doesn't hold %s permission", __func__,
-          getpid(), getuid(), kCreateVirtualDevicePermission);
+  if (!hasCameraOwnerPermission(mPermissionProxy)) {
+    ALOGE("%s: caller (pid %d, uid %d) is not allowed to own a camera", __func__,
+          getpid(), getuid());
     return ndk::ScopedAStatus::fromExceptionCode(EX_SECURITY);
   }
 
@@ -351,6 +426,13 @@ ndk::ScopedAStatus VirtualCameraService::unregisterCamera(
     return ndk::ScopedAStatus::ok();
   }
 
+  const auto cookieIt = mOwnerDeathCookies.find(it->second);
+  if (cookieIt != mOwnerDeathCookies.end()) {
+    AIBinder_unlinkToDeath(token.get(), mOwnerDeathRecipient, cookieIt->second);
+    delete cookieIt->second;
+    mOwnerDeathCookies.erase(cookieIt);
+  }
+
   mVirtualCameraProvider->removeCamera(it->second);
 
   mTokenToCameraName.erase(it);
@@ -359,9 +441,9 @@ ndk::ScopedAStatus VirtualCameraService::unregisterCamera(
 
 ndk::ScopedAStatus VirtualCameraService::getCameraId(
     const ::ndk::SpAIBinder& token, std::string* _aidl_return) {
-  if (!mPermissionProxy.checkCallingPermission(kCreateVirtualDevicePermission)) {
-    ALOGE("%s: caller (pid %d, uid %d) doesn't hold %s permission", __func__,
-          getpid(), getuid(), kCreateVirtualDevicePermission);
+  if (!hasCameraOwnerPermission(mPermissionProxy)) {
+    ALOGE("%s: caller (pid %d, uid %d) is not allowed to own a camera", __func__,
+          getpid(), getuid());
     return ndk::ScopedAStatus::fromExceptionCode(EX_SECURITY);
   }
 
@@ -444,11 +526,8 @@ binder_status_t VirtualCameraService::handleShellCommand(int, int out, int err,
 binder_status_t VirtualCameraService::enableTestCameraCmd(
     const int out, const int err,
     const std::map<std::string, std::string>& options) {
-  if (mTestCameraToken != nullptr) {
-    dprintf(out, "Test camera is already enabled (%s).\n",
-            getCamera(mTestCameraToken)->getCameraName().c_str());
-    return STATUS_OK;
-  }
+  // Several test cameras may be enabled at the same time: they are useful to
+  // exercise concurrent camera usage without a Virtual Camera owner app.
 
   std::optional<std::string> cameraId;
   auto it = options.find("camera_id");
@@ -509,7 +588,10 @@ binder_status_t VirtualCameraService::enableTestCameraCmd(
   }
 
   sp<BBinder> token = sp<BBinder>::make();
-  mTestCameraToken.set(AIBinder_fromPlatformBinder(token));
+  // AIBinder_fromPlatformBinder returns a new reference, adopted by cameraToken
+  // and kept alive through mTestCameraTokens once registration succeeded.
+  ::ndk::SpAIBinder cameraToken;
+  cameraToken.set(AIBinder_fromPlatformBinder(token));
 
   bool ret;
   VirtualCameraConfiguration configuration;
@@ -524,26 +606,52 @@ binder_status_t VirtualCameraService::enableTestCameraCmd(
       ndk::SharedRefBase::make<VirtualCameraTestInstance>(
           inputFps.value_or(kTestCameraDefaultInputFps));
   registerCameraNoCheck(
-      mTestCameraToken, configuration,
+      cameraToken, configuration,
       cameraId.value_or(std::to_string(sNextIdNumericalPortion++)),
       kDefaultDeviceId, &ret);
   if (!ret) {
     dprintf(err, "Failed to create test camera (error %d)\n", ret);
-    mTestCameraToken.set(nullptr);
     return EOPNOTSUPP;
   }
 
+  std::string cameraName;
+  {
+    const std::lock_guard<std::mutex> lock(mLock);
+    const auto it = mTokenToCameraName.find(cameraToken);
+    if (it != mTokenToCameraName.end()) {
+      cameraName = it->second;
+    }
+    mTestCameraTokens.push_back(std::move(cameraToken));
+  }
+
   dprintf(out, "Successfully registered test camera %s\n",
-          getCamera(mTestCameraToken)->getCameraName().c_str());
+          cameraName.empty() ? "(unknown)" : cameraName.c_str());
   return STATUS_OK;
 }
 
 binder_status_t VirtualCameraService::disableTestCameraCmd(const int out) {
-  if (mTestCameraToken == nullptr) {
-    dprintf(out, "Test camera is not registered.");
+  std::vector<::ndk::SpAIBinder> tokens;
+  {
+    const std::lock_guard<std::mutex> lock(mLock);
+    tokens.swap(mTestCameraTokens);
   }
-  binder_status_t ret = unregisterCamera(mTestCameraToken).getStatus();
-  mTestCameraToken.set(nullptr);
+
+  if (tokens.empty()) {
+    dprintf(out, "Test camera is not registered.\n");
+    return STATUS_OK;
+  }
+
+  binder_status_t ret = STATUS_OK;
+  for (const auto& token : tokens) {
+    // unregisterCamera() checks the CREATE_VIRTUAL_DEVICE permission of the
+    // caller and must not be called with mLock held.
+    const binder_status_t status = unregisterCamera(token).getStatus();
+    if (status != STATUS_OK) {
+      ret = status;
+    }
+  }
+
+  dprintf(out, "Disabled %zu test camera(s).\n", tokens.size());
   return ret;
 }
 

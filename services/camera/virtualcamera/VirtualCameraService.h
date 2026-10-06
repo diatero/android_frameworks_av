@@ -20,6 +20,7 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 
 #include "VirtualCameraDevice.h"
 #include "VirtualCameraProvider.h"
@@ -81,10 +82,10 @@ class VirtualCameraService
   static constexpr int kDefaultDeviceId = 0;
 
  private:
-  // Create and enable test camera instance if there's none.
+  // Create and enable an additional test camera instance.
   binder_status_t enableTestCameraCmd(
       int out, int err, const std::map<std::string, std::string>& options);
-  // Disable and destroy test camera instance if there's one.
+  // Disable and destroy every test camera instance created through the shell.
   binder_status_t disableTestCameraCmd(int out);
 
   // Register camera corresponding to the binder token without checking for
@@ -95,6 +96,21 @@ class VirtualCameraService
           configuration,
       const std::string& cameraId, int32_t deviceId, bool* _aidl_return)
       EXCLUDES(mLock);
+
+  // Drop the camera of an owner that went away: otherwise the camera stays registered and
+  // keeps being advertised to applications until the HAL is restarted.
+  struct OwnerDeathCookie {
+    VirtualCameraService* service;
+    std::string cameraName;
+  };
+  static void onOwnerDied(void* cookie);
+  void removeCameraOfDeadOwner(const std::string& cameraName) EXCLUDES(mLock);
+
+  // Returns the lowest camera id that is currently unused for the given device. A camera that is
+  // unregistered and registered again keeps its id, unlike with a monotonically increasing counter:
+  // camera applications cache camera ids (for example in their lens selector) and a new id for the
+  // same camera on every registration makes those caches stale.
+  std::string createCameraIdLocked(const int32_t deviceId) REQUIRES(mLock);
 
   std::shared_ptr<VirtualCameraProvider> mVirtualCameraProvider;
   bool mCheckHardwareRequirements = true;
@@ -110,8 +126,14 @@ class VirtualCameraService
   std::unordered_map<::ndk::SpAIBinder, std::string, BinderTokenHash>
       mTokenToCameraName GUARDED_BY(mLock);
 
-  // Local binder token for test camera instance, or nullptr if there's none.
-  ::ndk::SpAIBinder mTestCameraToken;
+  // Death notification shared by every owner registration, and the cookie registered for
+  // each of them, keyed by camera name.
+  AIBinder_DeathRecipient* mOwnerDeathRecipient;
+  std::unordered_map<std::string, OwnerDeathCookie*> mOwnerDeathCookies GUARDED_BY(mLock);
+
+  // Local binder tokens for the test camera instances created through the
+  // shell command, empty if there's none.
+  std::vector<::ndk::SpAIBinder> mTestCameraTokens GUARDED_BY(mLock);
 };
 
 }  // namespace virtualcamera

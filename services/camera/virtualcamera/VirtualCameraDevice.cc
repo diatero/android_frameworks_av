@@ -608,7 +608,12 @@ ndk::ScopedAStatus VirtualCameraDevice::getResourceCost(
   if (_aidl_return == nullptr) {
     return cameraStatus(Status::ILLEGAL_ARGUMENT);
   }
-  _aidl_return->resourceCost = 100;  // ¯\_(ツ)_/¯
+  // 100 would mean "the whole camera resource budget", which is not the case
+  // for a virtual camera: it renders software frames and does not take
+  // exclusive control of camera hardware. Keeping the cost low lets the camera
+  // framework arbitrate several virtual cameras at once, and also allows a
+  // virtual camera to be used while a physical camera is open.
+  _aidl_return->resourceCost = 1;
   return ndk::ScopedAStatus::ok();
 }
 
